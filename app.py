@@ -19,49 +19,35 @@ def load_embedding_model():
 
 def split_sentences(text):
     sentences = re.split(r"(?<=[.!?。！？])\s+|\n+", text)
-    return [s.strip() for s in sentences if len(s.strip()) > 18]
+    return [s.strip() for s in sentences if len(s.strip()) > 12]
 
 
 def get_similarity(text1, text2, model):
     embeddings = model.encode([text1, text2])
-    return cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-
-
-def get_consensus_level(score):
-    if score >= 80:
-        return "HIGH", "🟢", "두 답변의 의미적 합의도가 높습니다."
-    elif score >= 50:
-        return "MEDIUM", "🟡", "두 답변이 일부 유사하지만 차이도 존재합니다."
-    else:
-        return "LOW", "🔴", "두 답변의 차이가 큽니다. 사용자의 주의가 필요합니다."
+    return float(cosine_similarity([embeddings[0]], [embeddings[1]])[0][0])
 
 
 def get_question_type_rule(question_type):
     rules = {
         "사실 정보": {
             "rule": "사실 정보는 모델 간 합의도가 높더라도 공식 출처 확인이 필요합니다.",
-            "risk": "중간",
-            "color": "blue"
+            "risk": "중간"
         },
         "의견/예측": {
             "rule": "의견이나 미래 예측은 모델마다 관점이 다를 수 있으므로 낮은 합의도가 반드시 오류를 의미하지 않습니다.",
-            "risk": "중간",
-            "color": "yellow"
+            "risk": "중간"
         },
         "의학/법률/금융": {
             "rule": "의학·법률·금융 질문은 AI 답변만으로 판단해서는 안 되며 전문가 또는 공식 자료 확인이 필수입니다.",
-            "risk": "높음",
-            "color": "red"
+            "risk": "높음"
         },
         "코드/수학": {
             "rule": "코드와 수학 문제는 답변 비교뿐 아니라 실제 실행, 계산, 테스트를 통한 검증이 필요합니다.",
-            "risk": "중간",
-            "color": "orange"
+            "risk": "중간"
         },
         "창작": {
             "rule": "창작 요청은 정답 여부보다 사용자의 요구사항과 얼마나 잘 맞는지가 중요합니다.",
-            "risk": "낮음",
-            "color": "green"
+            "risk": "낮음"
         }
     }
     return rules.get(question_type, rules["사실 정보"])
@@ -73,7 +59,9 @@ def analyze_claims(gpt_answer, gemini_answer, model):
 
     common_claims = []
     gpt_unique = []
+    gemini_unique = []
 
+    # GPT 문장 기준으로 Gemini와 가장 비슷한 문장 찾기
     for gpt_s in gpt_sentences:
         best_score = 0
         best_match = ""
@@ -84,13 +72,14 @@ def analyze_claims(gpt_answer, gemini_answer, model):
                 best_score = score
                 best_match = gemini_s
 
-        if best_score >= 0.65:
-            common_claims.append((gpt_s, best_match, round(float(best_score) * 100, 2)))
+        similarity_percent = round(best_score * 100, 2)
+
+        if best_score >= 0.60:
+            common_claims.append((gpt_s, best_match, similarity_percent))
         else:
             gpt_unique.append(gpt_s)
 
-    gemini_unique = []
-
+    # Gemini만 강조한 내용 찾기
     for gemini_s in gemini_sentences:
         best_score = 0
 
@@ -99,7 +88,7 @@ def analyze_claims(gpt_answer, gemini_answer, model):
             if score > best_score:
                 best_score = score
 
-        if best_score < 0.65:
+        if best_score < 0.60:
             gemini_unique.append(gemini_s)
 
     common_claims = sorted(common_claims, key=lambda x: x[2], reverse=True)
@@ -107,13 +96,68 @@ def analyze_claims(gpt_answer, gemini_answer, model):
     return common_claims[:3], gpt_unique[:3], gemini_unique[:3]
 
 
-def make_report(question, question_type, score, level, common_claims, gpt_unique, gemini_unique, warning):
+def calculate_consensus_score(gpt_answer, gemini_answer, common_claims, gpt_unique, gemini_unique, model):
+    # 1. 전체 답변 유사도
+    full_similarity = get_similarity(gpt_answer, gemini_answer, model) * 100
+
+    # 2. 공통 주장 평균 유사도
+    if common_claims:
+        claim_similarity = sum([claim[2] for claim in common_claims]) / len(common_claims)
+    else:
+        claim_similarity = 0
+
+    # 3. 공통 주장 비율
+    total_items = len(common_claims) + len(gpt_unique) + len(gemini_unique)
+    if total_items > 0:
+        common_ratio = (len(common_claims) / total_items) * 100
+    else:
+        common_ratio = 0
+
+    # 4. 최종 점수
+    final_score = (
+        full_similarity * 0.30
+        + claim_similarity * 0.50
+        + common_ratio * 0.20
+    )
+
+    # 너무 낮게 왜곡되는 것 방지
+    if claim_similarity >= 80 and len(common_claims) >= 1:
+        final_score = max(final_score, 80)
+
+    return round(final_score, 2), round(full_similarity, 2), round(claim_similarity, 2), round(common_ratio, 2)
+
+
+def get_consensus_level(score):
+    if score >= 80:
+        return "HIGH", "🟢", "두 답변의 핵심 의미가 상당히 유사합니다."
+    elif score >= 50:
+        return "MEDIUM", "🟡", "두 답변이 일부 유사하지만 관점이나 강조점의 차이가 존재합니다."
+    else:
+        return "LOW", "🔴", "두 답변의 방향이나 핵심 내용에 큰 차이가 있습니다."
+
+
+def make_report(
+    question,
+    question_type,
+    final_score,
+    full_similarity,
+    claim_similarity,
+    common_ratio,
+    level,
+    common_claims,
+    gpt_unique,
+    gemini_unique,
+    warning
+):
     lines = []
     lines.append("AI Consensus Judge - Analysis Report")
     lines.append("")
     lines.append(f"Question: {question}")
     lines.append(f"Question Type: {question_type}")
-    lines.append(f"Consensus Score: {score}")
+    lines.append(f"Final Consensus Score: {final_score}")
+    lines.append(f"Full Response Similarity: {full_similarity}")
+    lines.append(f"Claim Similarity: {claim_similarity}")
+    lines.append(f"Common Claim Ratio: {common_ratio}")
     lines.append(f"Consensus Level: {level}")
     lines.append("")
     lines.append("Common Claims")
@@ -148,7 +192,7 @@ st.markdown(
     """
     <style>
     .main-title {
-        font-size: 2.6rem;
+        font-size: 2.7rem;
         font-weight: 800;
         margin-bottom: 0rem;
     }
@@ -156,19 +200,6 @@ st.markdown(
         font-size: 1.05rem;
         color: #6b7280;
         margin-bottom: 1.5rem;
-    }
-    .card {
-        padding: 1.1rem;
-        border-radius: 0.9rem;
-        border: 1px solid #e5e7eb;
-        background-color: #ffffff;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        margin-bottom: 1rem;
-    }
-    .small-label {
-        font-size: 0.85rem;
-        color: #6b7280;
-        font-weight: 600;
     }
     </style>
     """,
@@ -184,27 +215,25 @@ st.markdown(
 
 st.markdown(
     """
-    이 웹앱은 사용자의 질문에 대해 **Gemini 답변을 자동 생성**하고, 사용자가 붙여넣은 **GPT 답변**과 비교하여  
-    공통 주장, 충돌 가능 지점, 질문 유형별 주의 메시지를 제공합니다.
+    이 웹앱은 사용자의 질문에 대해 **Gemini 답변을 자동 생성**하고,  
+    사용자가 붙여넣은 **GPT 답변**과 비교하여 공통 주장, 차이점, 사용자 주의 메시지를 제공합니다.
     """
 )
 
 with st.sidebar:
     st.header("Settings")
 
-    api_key = st.text_input("Gemini API Key", type="password")
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
 
     question_type = st.selectbox(
         "Question Type",
         ["사실 정보", "의견/예측", "의학/법률/금융", "코드/수학", "창작"]
     )
 
-    st.caption("질문 유형에 따라 평가 규칙과 사용자 주의 메시지가 달라집니다.")
+    rule_info = get_question_type_rule(question_type)
 
     st.divider()
-
-    st.markdown("### Evaluation Rules")
-    rule_info = get_question_type_rule(question_type)
+    st.markdown("### Question Type Rule")
     st.write(rule_info["rule"])
     st.write(f"Risk Level: {rule_info['risk']}")
 
@@ -212,7 +241,7 @@ with st.sidebar:
 question = st.text_area(
     "1. 질문을 입력하세요",
     height=110,
-    placeholder="예: 2035년에는 인간보다 AI가 대부분의 직업에서 더 뛰어난 성능을 보일 것이라고 생각하는가?"
+    placeholder="예: 전화기를 발명한 사람은 누구인가요?"
 )
 
 col1, col2 = st.columns(2)
@@ -258,26 +287,33 @@ if st.button("합의도 분석 시작", type="primary", use_container_width=True
         with st.spinner("답변 분석 중..."):
             embed_model = load_embedding_model()
 
-            similarity = get_similarity(gpt_answer, gemini_answer, embed_model)
-            consensus_score = round(float(similarity) * 100, 2)
-            level, icon, level_message = get_consensus_level(consensus_score)
-            rule_info = get_question_type_rule(question_type)
-
             common_claims, gpt_unique, gemini_unique = analyze_claims(
                 gpt_answer,
                 gemini_answer,
                 embed_model
             )
 
+            final_score, full_similarity, claim_similarity, common_ratio = calculate_consensus_score(
+                gpt_answer,
+                gemini_answer,
+                common_claims,
+                gpt_unique,
+                gemini_unique,
+                embed_model
+            )
+
+            level, icon, level_message = get_consensus_level(final_score)
+            rule_info = get_question_type_rule(question_type)
+
         st.subheader("Analysis Result")
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Consensus Score", f"{consensus_score}")
+        m1.metric("Consensus Score", f"{final_score}")
         m2.metric("Consensus Level", f"{icon} {level}")
         m3.metric("Question Type", question_type)
         m4.metric("Risk Level", rule_info["risk"])
 
-        st.progress(min(consensus_score / 100, 1.0))
+        st.progress(min(final_score / 100, 1.0))
 
         if level == "HIGH":
             st.success(level_message)
@@ -287,6 +323,12 @@ if st.button("합의도 분석 시작", type="primary", use_container_width=True
             st.error(level_message)
 
         st.info(f"질문 유형별 평가 규칙: {rule_info['rule']}")
+
+        st.subheader("Score Breakdown")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Full Similarity", f"{full_similarity}%")
+        b2.metric("Claim Similarity", f"{claim_similarity}%")
+        b3.metric("Common Claim Ratio", f"{common_ratio}%")
 
         st.subheader("🟢 공통 주장")
         if common_claims:
@@ -328,14 +370,19 @@ if st.button("합의도 분석 시작", type="primary", use_container_width=True
         st.subheader("🔵 종합 해석")
         st.write(
             f"이 질문은 '{question_type}' 유형으로 평가되었으며, "
-            f"GPT와 Gemini 답변의 전체 의미적 합의도는 {consensus_score}점입니다. "
-            "이 점수는 두 답변이 얼마나 비슷한 방향의 내용을 말하는지 보여주는 참고 지표입니다."
+            f"최종 Consensus Score는 {final_score}점입니다. "
+            f"이 점수는 전체 답변 유사도({full_similarity}%), "
+            f"공통 주장 유사도({claim_similarity}%), "
+            f"공통 주장 비율({common_ratio}%)을 함께 반영한 값입니다."
         )
 
         report_text = make_report(
             question,
             question_type,
-            consensus_score,
+            final_score,
+            full_similarity,
+            claim_similarity,
+            common_ratio,
             level,
             common_claims,
             gpt_unique,
